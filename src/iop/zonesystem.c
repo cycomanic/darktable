@@ -34,6 +34,7 @@
 #include "gui/gtk.h"
 #include "gui/presets.h"
 #include "iop/iop_api.h"
+#include "common/curve_tools.h"
 
 #include <librsvg/rsvg.h>
 // ugh, ugly hack. why do people break stuff all the time?
@@ -96,12 +97,12 @@ const char *name()
 int flags()
 {
   return IOP_FLAGS_SUPPORTS_BLENDING | IOP_FLAGS_INCLUDE_IN_STYLES | IOP_FLAGS_ALLOW_TILING
-         | IOP_FLAGS_PREVIEW_NON_OPENCL | IOP_FLAGS_DEPRECATED;
+         | IOP_FLAGS_PREVIEW_NON_OPENCL;
 }
 
 const char *deprecated_msg()
 {
-  return _("this module is deprecated. please use the tone equalizer module instead.");
+  return NULL;  // Return NULL to hide the deprecated message
 }
 
 int default_group()
@@ -113,7 +114,7 @@ dt_iop_colorspace_type_t default_colorspace(dt_iop_module_t *self,
                                             dt_dev_pixelpipe_t *pipe,
                                             dt_dev_pixelpipe_iop_t *piece)
 {
-  return IOP_CS_LAB;
+  return IOP_CS_RGB;
 }
 
 /* get the zone index of pixel lightness from zonemap */
@@ -124,33 +125,33 @@ static inline int _iop_zonesystem_zone_index_from_lightness(float lightness, flo
   return size - 1;
 }
 
-/* calculate a zonemap with scale values for each zone based on controlpoints from param */
-static inline void _iop_zonesystem_calculate_zonemap(dt_iop_zonesystem_params_t *p, float *zonemap)
-{
-  int steps = 0;
-  int pk = 0;
+/* calculate a zonemap with scale values for each zone based on controlpoints from param  */
+ static inline void _iop_zonesystem_calculate_zonemap(dt_iop_zonesystem_params_t *p, float *zonemap)
+ {
+   int steps = 0;
+   int pk = 0;
 
-  for(int k = 0; k < p->size; k++)
-  {
-    if((k > 0 && k < p->size - 1) && p->zone[k] == -1)
-      steps++;
-    else
-    {
-      /* set 0 and 1.0 for first and last element in zonesystem size, or the actually parameter value */
-      zonemap[k] = k == 0 ? 0.0 : k == (p->size - 1) ? 1.0 : p->zone[k];
+   for(int k = 0; k < p->size; k++)
+   {
+     if((k > 0 && k < p->size - 1) && p->zone[k] == -1)
+       steps++;
+     else
+     {
+       /* set 0 and 1.0 for first and last element in zonesystem size, or the actually parameter value */
+       zonemap[k] = k == 0 ? 0.0 : k == (p->size - 1) ? 1.0 : p->zone[k];
 
-      /* for each step from pk to k, calculate values
-          for now this is linear distributed
-      */
-      for(int l = 1; l <= steps; l++)
-        zonemap[pk + l] = zonemap[pk] + (((zonemap[k] - zonemap[pk]) / (steps + 1)) * l);
+       /* for each step from pk to k, calculate values
+           for now this is linear distributed
+       */
+       for(int l = 1; l <= steps; l++)
+         zonemap[pk + l] = zonemap[pk] + (((zonemap[k] - zonemap[pk]) / (steps + 1)) * l);
 
-      /* store k into pk and reset zone steps for next range*/
-      pk = k;
-      steps = 0;
-    }
-  }
-}
+       /* store k into pk and reset zone steps for next range*/
+       pk = k;
+       steps = 0;
+     }
+   }
+ }
 
 static void process_common_setup(dt_iop_module_t *self, dt_dev_pixelpipe_iop_t *piece,
                                  const void *const ivoid, void *const ovoid, const dt_iop_roi_t *const roi_in,
@@ -197,7 +198,8 @@ static void process_common_cleanup(dt_iop_module_t *self, dt_dev_pixelpipe_iop_t
      && g && g->in_preview_buffer
      && g->out_preview_buffer)
   {
-    float Lmax[] = { 100.0f };
+
+    float Lmax[] = { 100.0f };  // Set to 100 for 0-100 range
     float Lmin[] = { 0.0f };
 
     /* setup gaussian kernel */
@@ -210,9 +212,15 @@ static void process_common_cleanup(dt_iop_module_t *self, dt_dev_pixelpipe_iop_t
 
     if(gauss && tmp)
     {
+
+      // Calculate luminance from linear RGB for input
       DT_OMP_FOR()
       for(size_t k = 0; k < (size_t)width * height; k++)
-        tmp[k] = ((float *)ivoid)[ch * k];
+      {
+        const float *pixel = &((float *)ivoid)[ch * k];
+        tmp[k] = 0.2126f * pixel[0] + 0.7152f * pixel[1] + 0.0722f * pixel[2];
+        tmp[k] *= 100.0f;  // Scale to 0-100 range
+      }
 
       dt_gaussian_blur(gauss, tmp, tmp);
 
@@ -221,31 +229,37 @@ static void process_common_cleanup(dt_iop_module_t *self, dt_dev_pixelpipe_iop_t
       DT_OMP_FOR()
       for(size_t k = 0; k < (size_t)width * height; k++)
       {
-        g->in_preview_buffer[k] = CLAMPS(tmp[k] * (size - 1) / 100.0f, 0, size - 2);
+        g->in_preview_buffer[k] = CLAMPS(tmp[k] * d->rzscale, 0, size - 2);
       }
       dt_iop_gui_leave_critical_section(self);
 
 
+      // Calculate luminance from linear RGB for output
       DT_OMP_FOR()
       for(size_t k = 0; k < (size_t)width * height; k++)
-        tmp[k] = ((float *)ovoid)[ch * k];
+      {
+        const float *pixel = &((float *)ovoid)[ch * k];
+        tmp[k] = 0.2126f * pixel[0] + 0.7152f * pixel[1] + 0.0722f * pixel[2];
+        tmp[k] *= 100.0f;  // Scale to 0-100 range
+      }
 
       dt_gaussian_blur(gauss, tmp, tmp);
-
 
       /* create zonemap preview for output */
       dt_iop_gui_enter_critical_section(self);
       DT_OMP_FOR()
       for(size_t k = 0; k < (size_t)width * height; k++)
       {
-        g->out_preview_buffer[k] = CLAMPS(tmp[k] * (size - 1) / 100.0f, 0, size - 2);
+        g->out_preview_buffer[k] = CLAMPS(tmp[k] * d->rzscale, 0, size - 2);
       }
       dt_iop_gui_leave_critical_section(self);
+      
     }
 
     g_free(tmp);
     if(gauss) dt_gaussian_free(gauss);
   }
+  
 }
 
 void process(dt_iop_module_t *self, dt_dev_pixelpipe_iop_t *piece, const void *const ivoid,
@@ -264,17 +278,47 @@ void process(dt_iop_module_t *self, dt_dev_pixelpipe_iop_t *piece, const void *c
   float *const restrict out = (float *const)ovoid;
   const size_t npixels = (size_t)roi_out->width * roi_out->height;
 
+
+  /* calculate zonemap */
+  float zonemap[MAX_ZONE_SYSTEM_SIZE] = { -1 };
+  _iop_zonesystem_calculate_zonemap(&(d->params), zonemap);
+
   DT_OMP_FOR()
-  for(size_t k = 0; k < (size_t)4 * npixels; k += 4)
+  for(size_t i = 0; i < npixels; i++)
   {
+    const size_t k = i * 4;
+    
     /* remap lightness into zonemap and apply lightness */
-    const int rz = CLAMPS(in[k] * d->rzscale, 0, size - 2); // zone index
-    const float zs = ((rz > 0) ? (d->zonemap_offset[rz] / in[k]) : 0) + d->zonemap_scale[rz];
-    for_each_channel(c,aligned(in,out))
-    {
-      out[k+c] = in[k+c] * zs;
-    }
+    // Calculate relative luminance from linear RGB (Rec. 709 coefficients)
+    const float Y = 0.2126f * in[k] + 0.7152f * in[k+1] + 0.0722f * in[k+2];
+    
+    // Convert to 0-100 range for zone calculation (like Lab L was)
+    const float Y100 = Y * 100.0f;
+    
+    // Map luminance to zone index
+    const int zone = CLAMPS((int)(Y100 * d->rzscale), 0, size - 2);
+    
+    // Get the target zone value from zonemap
+    const float zone_in = Y100 / 100.0f;  // Normalize back to 0-1
+    const float zone_out_low = zonemap[zone];
+    const float zone_out_high = zonemap[zone + 1];
+    
+    // Interpolate within the zone
+    const float zone_base = zone / (float)(size - 1);
+    const float zone_top = (zone + 1) / (float)(size - 1);
+    const float t = (zone_in - zone_base) / (zone_top - zone_base);
+    const float target_Y = zone_out_low + t * (zone_out_high - zone_out_low);
+    
+    // Calculate scaling factor
+    const float scale = (Y > 0.0001f) ? (target_Y / zone_in) : 1.0f;
+    
+    // Apply scaling to RGB channels (preserve ratios for color consistency)
+    out[k] = in[k] * scale;
+    out[k+1] = in[k+1] * scale;
+    out[k+2] = in[k+2] * scale;
+    out[k+3] = in[k+3];  // Copy alpha channel unchanged
   }
+
 
   process_common_cleanup(self, piece, ivoid, ovoid, roi_in, roi_out);
 }
@@ -300,9 +344,9 @@ int process_cl(dt_iop_module_t *self, dt_dev_pixelpipe_iop_t *piece, cl_mem dev_
 
   _iop_zonesystem_calculate_zonemap(&(data->params), zonemap);
 
-  /* precompute scale and offset */
+  /* precompute scale and offset - adjusted for 0-1 range instead of 0-100 */
   for(int k = 0; k < size - 1; k++) zonemap_scale[k] = (zonemap[k + 1] - zonemap[k]) * (size - 1);
-  for(int k = 0; k < size - 1; k++) zonemap_offset[k] = 100.0f * ((k + 1) * zonemap[k] - k * zonemap[k + 1]);
+  for(int k = 0; k < size - 1; k++) zonemap_offset[k] = (k + 1) * zonemap[k] - k * zonemap[k + 1];
 
   dev_zmo = dt_opencl_copy_host_to_device_constant(devid, sizeof(float) * ROUNDUP(MAX_ZONE_SYSTEM_SIZE, 16),
                                                    zonemap_offset);
@@ -348,7 +392,7 @@ void commit_params(dt_iop_module_t *self, dt_iop_params_t *p1, dt_dev_pixelpipe_
   dt_iop_zonesystem_data_t *d = piece->data;
 
   d->params = *p;
-  d->rzscale = (d->params.size - 1) / 100.0f;
+  d->rzscale = (d->params.size - 1) / 100.0f;  // Map 0-100 range to zone indices
 
   /* calculate zonemap */
   float zonemap[MAX_ZONE_SYSTEM_SIZE] = { -1 };
@@ -356,10 +400,6 @@ void commit_params(dt_iop_module_t *self, dt_iop_params_t *p1, dt_dev_pixelpipe_
 
   const int size = d->params.size;
 
-  // precompute scale and offset
-  for(int k = 0; k < size - 1; k++) d->zonemap_scale[k] = (zonemap[k + 1] - zonemap[k]) * (size - 1);
-  for(int k = 0; k < size - 1; k++)
-    d->zonemap_offset[k] = 100.0f * ((k + 1) * zonemap[k] - k * zonemap[k + 1]);
 }
 
 void init_pipe(dt_iop_module_t *self, dt_dev_pixelpipe_t *pipe, dt_dev_pixelpipe_iop_t *piece)
