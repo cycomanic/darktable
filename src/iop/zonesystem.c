@@ -18,6 +18,7 @@
 #include <assert.h>
 #include <stdlib.h>
 #include <string.h>
+#include <math.h>
 
 #include "common/darktable.h"
 #include "common/gaussian.h"
@@ -36,6 +37,7 @@
 #include "iop/iop_api.h"
 #include "common/curve_tools.h"
 
+
 #include <librsvg/rsvg.h>
 // ugh, ugly hack. why do people break stuff all the time?
 #ifndef RSVG_CAIRO_H
@@ -45,6 +47,7 @@
 
 DT_MODULE_INTROSPECTION(1, dt_iop_zonesystem_params_t)
 #define MAX_ZONE_SYSTEM_SIZE 24
+#define DEGREE 3
 
 /** gui params. */
 typedef struct dt_iop_zonesystem_params_t
@@ -60,6 +63,8 @@ typedef struct dt_iop_zonesystem_data_t
   float rzscale;
   float zonemap_offset[MAX_ZONE_SYSTEM_SIZE];
   float zonemap_scale[MAX_ZONE_SYSTEM_SIZE];
+  float *curve;           // High-resolution curve for processing
+  int curve_size;         // Size of the curve array
 } dt_iop_zonesystem_data_t;
 
 
@@ -103,6 +108,10 @@ typedef struct dt_iop_zonesystem_gui_data_t
 
 } dt_iop_zonesystem_gui_data_t;
 
+typedef struct {
+    float x;
+    float y;
+} Point;
 
 const char *name()
 {
@@ -140,33 +149,269 @@ static inline int _iop_zonesystem_zone_index_from_lightness(float lightness, flo
   return size - 1;
 }
 
-/* calculate a zonemap with scale values for each zone based on controlpoints from param  */
- static inline void _iop_zonesystem_calculate_zonemap(dt_iop_zonesystem_params_t *p, float *zonemap)
- {
-   int steps = 0;
-   int pk = 0;
+// Helper function to calculate basis functions
+static void _basis_functions(int degree, float t, int num_control_points,
+                            const float *knots, int knots_count, float *N) {
+    float *temp = (float *)malloc((knots_count - 1) * sizeof(float));
 
-   for(int k = 0; k < p->size; k++)
-   {
-     if((k > 0 && k < p->size - 1) && p->zone[k] == -1)
-       steps++;
-     else
-     {
-       /* set 0 and 1.0 for first and last element in zonesystem size, or the actually parameter value */
-       zonemap[k] = k == 0 ? 0.0 : k == (p->size - 1) ? 1.0 : p->zone[k];
+    // Initialize first order basis functions N[i][1]
+    for (int i = 0; i < knots_count - 1; i++) {
+        if (t >= knots[i] && t < knots[i + 1]) {
+            temp[i] = 1.0f;
+        } else {
+            temp[i] = 0.0f;
+        }
+    }
 
-       /* for each step from pk to k, calculate values
-           for now this is linear distributed
-       */
-       for(int l = 1; l <= steps; l++)
-         zonemap[pk + l] = zonemap[pk] + (((zonemap[k] - zonemap[pk]) / (steps + 1)) * l);
+    // Calculate higher order basis functions recursively
+    for (int p = 2; p <= degree + 1; p++) {
+        for (int i = 0; i < knots_count - p; i++) {
+            float d = 0.0f;
+            if (temp[i] != 0.0f) {
+                float denom = knots[i + p - 1] - knots[i];
+                if (denom != 0.0f) {
+                    d = ((t - knots[i]) * temp[i]) / denom;
+                }
+            }
 
-       /* store k into pk and reset zone steps for next range*/
-       pk = k;
-       steps = 0;
-     }
+            float e = 0.0f;
+            if (temp[i + 1] != 0.0f) {
+                float denom = knots[i + p] - knots[i + 1];
+                if (denom != 0.0f) {
+                    e = ((knots[i + p] - t) * temp[i + 1]) / denom;
+                }
+            }
+
+            temp[i] = d + e;
+        }
+    }
+
+    // Handle the last point
+    if (fabs(t - knots[knots_count - 1]) < 1e-10f) {
+        temp[num_control_points - 1] = 1.0f;
+    }
+
+    // Copy to output
+    for (int i = 0; i < num_control_points; i++) {
+        N[i] = temp[i];
+    }
+
+    free(temp);
+}
+
+float _nurbs_evaluate(const Point *control_points, const float *weights,
+                      int num_control_points, const float *knots, int knots_count,
+                      int degree, float target_x) {
+    // Clamp target_x to valid range
+    if (target_x < control_points[0].x) {
+        target_x = control_points[0].x;
+    }
+    if (target_x > control_points[num_control_points - 1].x) {
+        target_x = control_points[num_control_points - 1].x;
+    }
+
+    float max_t = knots[knots_count - 1];
+    float t_min = 0.0f;
+    float t_max = max_t;
+    float tolerance = 1e-6f;
+    int max_iterations = 20;
+    float t = max_t / 2.0f; // Initial guess
+
+    for (int iter = 0; iter < max_iterations; iter++) {
+        t = (t_min + t_max) / 2.0f;
+
+        // Calculate basis functions
+        float *N = (float *)malloc(num_control_points * sizeof(float));
+        _basis_functions(degree, t, num_control_points, knots, knots_count, N);
+
+        // Calculate weighted sum
+        float weight_sum = 0.0f;
+        for (int i = 0; i < num_control_points; i++) {
+            weight_sum += N[i] * weights[i];
+        }
+
+        // Calculate x(t) and y(t)
+        float x_at_t = 0.0f;
+        float y_at_t = 0.0f;
+
+        if (weight_sum != 0.0f) {
+            for (int i = 0; i < num_control_points; i++) {
+                float rational_basis = (N[i] * weights[i]) / weight_sum;
+                x_at_t += rational_basis * control_points[i].x;
+                y_at_t += rational_basis * control_points[i].y;
+            }
+        }
+
+        // Check if we found target_x
+        if (fabs(x_at_t - target_x) < tolerance) {
+            free(N);
+            return y_at_t;
+        }
+
+        // Adjust search range (binary search)
+        if (x_at_t < target_x) {
+            t_min = t;
+        } else {
+            t_max = t;
+        }
+
+        free(N);
+    }
+
+    // After max iterations, use the final t value
+    // This handles the edge case where we didn't converge exactly
+    float *N = (float *)malloc(num_control_points * sizeof(float));
+    _basis_functions(degree, t, num_control_points, knots, knots_count, N);
+
+    float weight_sum = 0.0f;
+    float y = 0.0f;
+
+    for (int i = 0; i < num_control_points; i++) {
+        weight_sum += N[i] * weights[i];
+    }
+
+    if (weight_sum != 0.0f) {
+        for (int i = 0; i < num_control_points; i++) {
+            float rational_basis = (N[i] * weights[i]) / weight_sum;
+            y += rational_basis * control_points[i].y;
+        }
+    }
+
+    free(N);
+    return y;
+}
+
+/* Create clamped knot vector for cubic B-spline (degree 3) */
+static inline void _create_clamped_knots(int num_control_points, int degree, float *knots)
+{
+  int knots_count = num_control_points + degree + 1;
+  knots[0] = 0.0f;
+  for (int i = 1; i < knots_count ; i++) {
+      if ((i > degree ) && (i < num_control_points + 1))
+      {
+          knots[i] = knots[i - 1] + 1;
+      }
+      else
+       {
+                knots[i] = knots[i - 1];
+       }
    }
- }
+}
+
+/* calculate a zonemap with scale values for each zone based on NURBS curve from control points */
+/* curve_array should be at least 10x larger than zonemap size and minimum 200 entries */
+static inline void _iop_zonesystem_calculate_zonemap(dt_iop_zonesystem_params_t *p, float *zonemap, float *curve_array, int curve_size)
+{
+  /* Count actual control points (excluding -1 placeholders) */
+  int num_control_points = 0; /* the outer points are always control points */
+  Point *control_points = malloc(p->size * sizeof(Point));
+
+  control_points[0] = (Point){0.0f, 0.0f};
+  num_control_points++;
+  for (int k = 1; k < p->size-1; k++)
+  {
+    if (p->zone[k] != -1)
+    {
+      control_points[num_control_points] = (Point){(float)k/(p->size - 1), p->zone[k]};
+      num_control_points++;
+    }
+  }
+  control_points[num_control_points] = (Point){1.0f, 1.0f};
+  num_control_points++;
+
+  /* If fewer than 4 control points, fall back to linear interpolation */
+  if (num_control_points < 4)
+  {
+    int steps = 0;
+    int pk = 0;
+
+    /* Fill zonemap with linear interpolation */
+    for (int k = 0; k < p->size; k++)
+    {
+      if ((k > 0 && k < p->size - 1) && p->zone[k] == -1)
+        steps++;
+      else
+      {
+        zonemap[k] = k == 0 ? 0.0f : k == (p->size - 1) ? 1.0f : p->zone[k];
+        for (int l = 1; l <= steps; l++)
+          zonemap[pk + l] = zonemap[pk] + (((zonemap[k] - zonemap[pk]) / (steps + 1)) * l);
+        pk = k;
+        steps = 0;
+      }
+    }
+
+    /* Fill curve_array with linear interpolation */
+    if (curve_array && curve_size > 0)
+    {
+      for (int i = 0; i < curve_size; i++)
+      {
+        float u = (float)i / (float)(curve_size - 1);
+        /* Find which control points bracket this u value */
+        int idx = 0;
+        for (int j = 0; j < num_control_points - 1; j++)
+        {
+          if (u >= control_points[j].x && u <= control_points[j + 1].x)
+          {
+            idx = j;
+            break;
+          }
+        }
+
+        /* Linear interpolation between control points */
+        float t = (u - control_points[idx].x) / (control_points[idx + 1].x - control_points[idx].x);
+        curve_array[i] = control_points[idx].y + t * (control_points[idx + 1].y - control_points[idx].y);
+        curve_array[i] = fmaxf(0.0f, fminf(1.0f, curve_array[i]));
+      }
+    }
+
+    free(control_points);
+    return;
+  }
+
+  /* Use NURBS curve with cubic spline (degree 3) */
+  int degree = 2;
+  int order = degree + 1;
+  int knots_count = num_control_points + order;
+  float *knots = malloc(knots_count * sizeof(float));
+  float *weights = malloc(num_control_points * sizeof(float));
+
+  /* Set up control points and weights */
+  for (int i = 0; i < num_control_points; i++)
+  {
+    /* Edge points have weight 1, internal points have weight 10 */
+    weights[i] = (i == 0 || i == num_control_points - 1) ? 1.0f : 10.0f;
+  }
+
+  /* Create clamped knot vector */
+  _create_clamped_knots(num_control_points, degree, knots);
+
+  /* Evaluate NURBS curve and fill zonemap (for GUI display) */
+  for (int k = 0; k < p->size; k++)
+  {
+    /* Map zone index k to parameter u in [0, 1] */
+    float u = (float)k/((float) p->size -1);
+    zonemap[k] = _nurbs_evaluate(control_points, weights, num_control_points, knots, knots_count, degree, u);
+    /* Clamp to valid range */
+    zonemap[k] = fmaxf(0.0f, fminf(1.0f, zonemap[k]));
+  }
+
+  /* Evaluate NURBS curve and fill high-resolution curve_array (for processing) */
+  if (curve_array && curve_size > 0)
+  {
+    for (int i = 0; i < curve_size; i++)
+    {
+      /* Map curve index i to parameter u in [0, 1] */
+      float u = (float)i / (float)(curve_size - 1);
+      curve_array[i] = _nurbs_evaluate(control_points, weights, num_control_points, knots, knots_count, degree, u);
+      /* Clamp to valid range */
+      curve_array[i] = fmaxf(0.0f, fminf(1.0f, curve_array[i]));
+    }
+  }
+
+  free(knots);
+  free(control_points);
+  free(weights);
+}
 
 static void process_common_setup(dt_iop_module_t *self, dt_dev_pixelpipe_iop_t *piece,
                                  const void *const ivoid, void *const ovoid, const dt_iop_roi_t *const roi_in,
@@ -280,60 +525,40 @@ static void process_common_cleanup(dt_iop_module_t *self, dt_dev_pixelpipe_iop_t
 void process(dt_iop_module_t *self, dt_dev_pixelpipe_iop_t *piece, const void *const ivoid,
              void *const ovoid, const dt_iop_roi_t *const roi_in, const dt_iop_roi_t *const roi_out)
 {
-  if(!dt_iop_have_required_input_format(4 /*we need full-color pixels*/, self, piece->colors,
-                                         ivoid, ovoid, roi_in, roi_out))
-    return;
-
   const dt_iop_zonesystem_data_t *const d = (const dt_iop_zonesystem_data_t *const)piece->data;
   process_common_setup(self, piece, ivoid, ovoid, roi_in, roi_out);
-
-  const int size = d->params.size;
 
   const float *const restrict in = (const float *const)ivoid;
   float *const restrict out = (float *const)ovoid;
   const size_t npixels = (size_t)roi_out->width * roi_out->height;
 
-
-  /* calculate zonemap */
-  float zonemap[MAX_ZONE_SYSTEM_SIZE] = { -1 };
-  _iop_zonesystem_calculate_zonemap(&(d->params), zonemap);
-
   DT_OMP_FOR()
   for(size_t i = 0; i < npixels; i++)
   {
     const size_t k = i * 4;
-    
-    /* remap lightness into zonemap and apply lightness */
-    // Calculate relative luminance from linear RGB (Rec. 709 coefficients)
+
+    /* Calculate relative luminance from linear RGB */
     const float Y = 0.2126f * in[k] + 0.7152f * in[k+1] + 0.0722f * in[k+2];
-    
-    // Convert to 0-100 range for zone calculation (like Lab L was)
-    const float Y100 = Y * 100.0f;
-    
-    // Map luminance to zone index
-    const int zone = CLAMPS((int)(Y100 * d->rzscale), 0, size - 2);
-    
-    // Get the target zone value from zonemap
-    const float zone_in = Y100 / 100.0f;  // Normalize back to 0-1
-    const float zone_out_low = zonemap[zone];
-    const float zone_out_high = zonemap[zone + 1];
-    
-    // Interpolate within the zone
-    const float zone_base = zone / (float)(size - 1);
-    const float zone_top = (zone + 1) / (float)(size - 1);
-    const float t = (zone_in - zone_base) / (zone_top - zone_base);
-    const float target_Y = zone_out_low + t * (zone_out_high - zone_out_low);
-    
-    // Calculate scaling factor
-    const float scale = (Y > 0.0001f) ? (target_Y / zone_in) : 1.0f;
-    
-    // Apply scaling to RGB channels (preserve ratios for color consistency)
+
+    /* Look up target value from high-resolution curve */
+    const float curve_position = Y * (d->curve_size - 1);
+    const int curve_idx_low = CLAMPS((int)curve_position, 0, d->curve_size - 2);
+    const int curve_idx_high = curve_idx_low + 1;
+
+    /* Calculate interpolation factor (fractional part) */
+    const float t = curve_position - curve_idx_low;
+
+    /* Linear interpolation between two curve points */
+    const float target_Y = d->curve[curve_idx_low] + t * (d->curve[curve_idx_high] - d->curve[curve_idx_low]);
+    /* Calculate scaling factor */
+    const float scale = (Y > 0.0001f) ? (target_Y / Y) : 1.0f;
+
+    /* Apply scaling to RGB channels */
     out[k] = in[k] * scale;
     out[k+1] = in[k+1] * scale;
     out[k+2] = in[k+2] * scale;
-    out[k+3] = in[k+3];  // Copy alpha channel unchanged
+    out[k+3] = in[k+3];
   }
-
 
   process_common_cleanup(self, piece, ivoid, ovoid, roi_in, roi_out);
 }
@@ -357,7 +582,7 @@ int process_cl(dt_iop_module_t *self, dt_dev_pixelpipe_iop_t *piece, cl_mem dev_
   float zonemap_offset[ROUNDUP(MAX_ZONE_SYSTEM_SIZE, 16)] = { -1 };
   float zonemap_scale[ROUNDUP(MAX_ZONE_SYSTEM_SIZE, 16)] = { -1 };
 
-  _iop_zonesystem_calculate_zonemap(&(data->params), zonemap);
+  _iop_zonesystem_calculate_zonemap(&(data->params), zonemap, NULL, 0);
 
   /* precompute scale and offset - adjusted for 0-1 range instead of 0-100 */
   for(int k = 0; k < size - 1; k++) zonemap_scale[k] = (zonemap[k + 1] - zonemap[k]) * (size - 1);
@@ -398,23 +623,23 @@ void cleanup_global(dt_iop_module_so_t *self)
   self->data = NULL;
 }
 
-
 void commit_params(dt_iop_module_t *self, dt_iop_params_t *p1, dt_dev_pixelpipe_t *pipe,
                    dt_dev_pixelpipe_iop_t *piece)
 {
   dt_iop_zonesystem_params_t *p = (dt_iop_zonesystem_params_t *)p1;
-
   dt_iop_zonesystem_data_t *d = piece->data;
 
   d->params = *p;
-  d->rzscale = (d->params.size - 1) / 100.0f;  // Map 0-100 range to zone indices
+  d->rzscale = (d->params.size - 1) / 100.0f;
 
-  /* calculate zonemap */
+  /* Allocate curve array (at least 10x zonemap size, minimum 200) */
+  d->curve_size = MAX(200, d->params.size * 10);
+  if(d->curve) free(d->curve);
+  d->curve = malloc(d->curve_size * sizeof(float));
+
+  /* Calculate zonemap and high-res curve */
   float zonemap[MAX_ZONE_SYSTEM_SIZE] = { -1 };
-  _iop_zonesystem_calculate_zonemap(&(d->params), zonemap);
-
-  const int size = d->params.size;
-
+  _iop_zonesystem_calculate_zonemap(&(d->params), zonemap, d->curve, d->curve_size);
 }
 
 void init_pipe(dt_iop_module_t *self, dt_dev_pixelpipe_t *pipe, dt_dev_pixelpipe_iop_t *piece)
@@ -424,6 +649,8 @@ void init_pipe(dt_iop_module_t *self, dt_dev_pixelpipe_t *pipe, dt_dev_pixelpipe
 
 void cleanup_pipe(dt_iop_module_t *self, dt_dev_pixelpipe_t *pipe, dt_dev_pixelpipe_iop_t *piece)
 {
+ dt_iop_zonesystem_data_t *d = piece->data;
+  if(d && d->curve) free(d->curve);
   free(piece->data);
   piece->data = NULL;
 }
@@ -564,7 +791,7 @@ static gboolean dt_iop_zonesystem_bar_draw(GtkWidget *widget, cairo_t *crf, dt_i
 
   /* render the bars */
   float zonemap[MAX_ZONE_SYSTEM_SIZE] = { 0 };
-  _iop_zonesystem_calculate_zonemap(p, zonemap);
+  _iop_zonesystem_calculate_zonemap(p, zonemap, NULL, 0);
   float s = (1. / (p->size - 2));
   cairo_set_antialias(cr, CAIRO_ANTIALIAS_NONE);
   for(int i = 0; i < p->size - 1; i++)
@@ -642,7 +869,7 @@ static gboolean dt_iop_zonesystem_bar_button_press(GtkWidget *widget, GdkEventBu
 
   /* calculate zonemap */
   float zonemap[MAX_ZONE_SYSTEM_SIZE] = { -1 };
-  _iop_zonesystem_calculate_zonemap(p, zonemap);
+  _iop_zonesystem_calculate_zonemap(p, zonemap,  NULL, 0);
 
   /* translate mouse into zone index */
   int k = _iop_zonesystem_zone_index_from_lightness(g->mouse_x / width, zonemap, p->size);
@@ -721,7 +948,7 @@ static gboolean dt_iop_zonesystem_bar_motion_notify(GtkWidget *widget, GdkEventM
 
   /* calculate zonemap */
   float zonemap[MAX_ZONE_SYSTEM_SIZE] = { -1 };
-  _iop_zonesystem_calculate_zonemap(p, zonemap);
+  _iop_zonesystem_calculate_zonemap(p, zonemap,  NULL, 0);
 
   /* record mouse position within control */
   g->mouse_x = CLAMP(event->x - inset, 0, width);
@@ -792,7 +1019,7 @@ static gboolean dt_iop_zonesystem_preview_draw(GtkWidget *widget, cairo_t *crf, 
   {
     /* calculate the zonemap */
     float zonemap[MAX_ZONE_SYSTEM_SIZE] = { -1 };
-    _iop_zonesystem_calculate_zonemap(p, zonemap);
+    _iop_zonesystem_calculate_zonemap(p, zonemap, NULL, 0);
 
     /* let's generate a pixbuf from pixel zone buffer */
     guchar *image = g_malloc_n((size_t)4 * g->preview_width * g->preview_height, sizeof(guchar));
