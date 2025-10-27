@@ -548,48 +548,47 @@ void process(dt_iop_module_t *self, dt_dev_pixelpipe_iop_t *piece, const void *c
   process_common_cleanup(self, piece, ivoid, ovoid, roi_in, roi_out);
 }
 
-#ifdef HAVE_OPENCL
-int process_cl(dt_iop_module_t *self, dt_dev_pixelpipe_iop_t *piece, cl_mem dev_in, cl_mem dev_out,
-               const dt_iop_roi_t *const roi_in, const dt_iop_roi_t *const roi_out)
-{
-  dt_iop_zonesystem_data_t *data = piece->data;
-  dt_iop_zonesystem_global_data_t *gd = self->global_data;
-  cl_mem dev_zmo, dev_zms = NULL;
-  cl_int err = DT_OPENCL_DEFAULT_ERROR;
-
-  const int devid = piece->pipe->devid;
-  const int width = roi_in->width;
-  const int height = roi_in->height;
-
-  /* calculate zonemap */
-  const int size = data->params.size;
-  float zonemap[MAX_ZONE_SYSTEM_SIZE] = { -1 };
-  float zonemap_offset[ROUNDUP(MAX_ZONE_SYSTEM_SIZE, 16)] = { -1 };
-  float zonemap_scale[ROUNDUP(MAX_ZONE_SYSTEM_SIZE, 16)] = { -1 };
-
-  _iop_zonesystem_calculate_zonemap(&(data->params), zonemap, NULL, 0);
-
-  /* precompute scale and offset - adjusted for 0-1 range instead of 0-100 */
-  for(int k = 0; k < size - 1; k++) zonemap_scale[k] = (zonemap[k + 1] - zonemap[k]) * (size - 1);
-  for(int k = 0; k < size - 1; k++) zonemap_offset[k] = (k + 1) * zonemap[k] - k * zonemap[k + 1];
-
-  dev_zmo = dt_opencl_copy_host_to_device_constant(devid, sizeof(float) * ROUNDUP(MAX_ZONE_SYSTEM_SIZE, 16),
-                                                   zonemap_offset);
-  if(dev_zmo == NULL) goto error;
-  dev_zms = dt_opencl_copy_host_to_device_constant(devid, sizeof(float) * ROUNDUP(MAX_ZONE_SYSTEM_SIZE, 16),
-                                                   zonemap_scale);
-  if(dev_zms == NULL) goto error;
-
-  err = dt_opencl_enqueue_kernel_2d_args(devid, gd->kernel_zonesystem, width, height,
-    CLARG(dev_in), CLARG(dev_out), CLARG(width), CLARG(height), CLARG(size), CLARG(dev_zmo), CLARG(dev_zms));
-
-error:
-  dt_opencl_release_mem_object(dev_zmo);
-  dt_opencl_release_mem_object(dev_zms);
-  return err;
-}
-#endif
-
+//#ifdef HAVE_OPENCL
+//int process_cl(dt_iop_module_t *self, dt_dev_pixelpipe_iop_t *piece, cl_mem dev_in, cl_mem dev_out,
+//               const dt_iop_roi_t *const roi_in, const dt_iop_roi_t *const roi_out)
+//{
+//  dt_iop_zonesystem_data_t *data = piece->data;
+//  dt_iop_zonesystem_global_data_t *gd = self->global_data;
+//  cl_mem dev_zmo, dev_zms = NULL;
+//  cl_int err = DT_OPENCL_DEFAULT_ERROR;
+//
+//  const int devid = piece->pipe->devid;
+//  const int width = roi_in->width;
+//  const int height = roi_in->height;
+//
+//  /* calculate zonemap */
+//  const int size = data->params.size;
+//  float zonemap[MAX_ZONE_SYSTEM_SIZE] = { -1 };
+//  float zonemap_offset[ROUNDUP(MAX_ZONE_SYSTEM_SIZE, 16)] = { -1 };
+//  float zonemap_scale[ROUNDUP(MAX_ZONE_SYSTEM_SIZE, 16)] = { -1 };
+//
+//  _iop_zonesystem_calculate_zonemap(&(data->params), zonemap, NULL, 0);
+//
+//  /* precompute scale and offset - adjusted for 0-1 range instead of 0-100 */
+//  for(int k = 0; k < size - 1; k++) zonemap_scale[k] = (zonemap[k + 1] - zonemap[k]) * (size - 1);
+//  for(int k = 0; k < size - 1; k++) zonemap_offset[k] = (k + 1) * zonemap[k] - k * zonemap[k + 1];
+//
+//  dev_zmo = dt_opencl_copy_host_to_device_constant(devid, sizeof(float) * ROUNDUP(MAX_ZONE_SYSTEM_SIZE, 16),
+//                                                   zonemap_offset);
+//  if(dev_zmo == NULL) goto error;
+//  dev_zms = dt_opencl_copy_host_to_device_constant(devid, sizeof(float) * ROUNDUP(MAX_ZONE_SYSTEM_SIZE, 16),
+//                                                   zonemap_scale);
+//  if(dev_zms == NULL) goto error;
+//
+//  err = dt_opencl_enqueue_kernel_2d_args(devid, gd->kernel_zonesystem, width, height,
+//    CLARG(dev_in), CLARG(dev_out), CLARG(width), CLARG(height), CLARG(size), CLARG(dev_zmo), CLARG(dev_zms));
+//
+//error:
+//  dt_opencl_release_mem_object(dev_zmo);
+//  dt_opencl_release_mem_object(dev_zms);
+//  return err;
+//}
+//#endif
 
 
 void init_global(dt_iop_module_so_t *self)
